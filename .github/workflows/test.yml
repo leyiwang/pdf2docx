@@ -1,7 +1,7 @@
 # Run test when triggering the workflow on push and pull request, 
 # but only for the master branch
 
-name: pdf2docx-test
+name: test
 
 on:
   push:
@@ -13,22 +13,22 @@ on:
       - master
 
 
-# Run test for any valid triggers
-# - checkout code
-# - create Python environment
-# - run unit test
+# -----------------------------------------------------------------------------------------------------
+# To leverage the benefit of Github Action, the testing process is divided into three jobs:
+#   1. pdf2docx: convert sample pdf to docx -> linux runner
+#   2. docx2pdf: convert generated docx to pdf for comparing -> specific runner with MS Word installed
+#   3. check_quality: convert page to image and compare similarity with python-opencv -> linux runner
+# -----------------------------------------------------------------------------------------------------
 jobs:
 
-  test:
+  pdf2docx:
 
-    # The type of runner that the job will run on
     runs-on: ubuntu-latest
 
     strategy:
       matrix:
-        python-version: [3.6, 3.7, 3.8]
+        python-version: ["3.8", "3.9", "3.10"]
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       - name: Check out code
         uses: actions/checkout@v2
@@ -37,9 +37,6 @@ jobs:
         uses: actions/setup-python@v2
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Display Python version
-        run: python -c "import sys; print(sys.version)"
 
       - name: Install dependencies
         run: |
@@ -50,10 +47,88 @@ jobs:
 
       - name: Run unit test
         run: |
-          pytest -v ./test/test.py --cov=./pdf2docx --cov-report=xml
+          pytest -v ./test/test.py::TestConversion --cov=./pdf2docx --cov-report=xml
 
       - name: Upload coverage reports to Codecov
         run: |
           codecov
         env: # Or as an environment variable
           super_secret: ${{ secrets.CODECOV_TOKEN }}
+      
+      # upload docx for further job
+      - name: Archive package
+        uses: actions/upload-artifact@v2
+        with:
+            name: outputs
+            path: ./test/outputs
+  
+
+  docx2pdf:
+    # a specific runner with MS Word installed
+    runs-on: self-hosted
+
+    needs: pdf2docx
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      # download artifacts from depending job
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: outputs
+          path: test\outputs
+
+      # convert docx to pdf with OfficeToPDF
+      - name: Convert to PDF
+        run: |
+          cd test\outputs
+          $files = Get-ChildItem "."
+          for ($i=0; $i -lt $files.Count; $i++) { 
+            $name = $files[$i].name;
+            echo "Converting $name to pdf...";
+            OfficeToPDF $files[$i] 
+          }
+          del *.docx
+      
+      # upload pdf for further job
+      - name: Archive package
+        uses: actions/upload-artifact@v2
+        with:
+            name: outputs
+            path: test\outputs
+
+
+  check_quality:
+
+    runs-on: ubuntu-latest
+
+    needs: docx2pdf
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      
+      # download artifacts from depending job
+      - name: Download artifacts
+        uses: actions/download-artifact@v2
+        with:
+          name: outputs
+          path: ./test/outputs
+
+      - name: Set up Python 3.x
+        uses: actions/setup-python@v1
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+          python setup.py develop
+
+      - name: Check converting quality
+        run: |
+          pytest -sv ./test/test.py::TestQuality

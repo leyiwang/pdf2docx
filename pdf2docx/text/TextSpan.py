@@ -1,22 +1,17 @@
 # -*- coding: utf-8 -*-
 
-'''
-Text Span object based on PDF raw dict extracted with PyMuPDF.
+'''Text Span object based on PDF raw dict extracted with ``PyMuPDF``.
 
-@created: 2020-07-22
-@author: train8808@gmail.com
----
+Data structure for Span refer to 
+this `link <https://pymupdf.readthedocs.io/en/latest/textpage.html>`_::
 
-Refer to: https://pymupdf.readthedocs.io/en/latest/textpage.html
-
-data structure for Span
     {
         # raw dict
         ---------------------------
         'bbox': (x0,y0,x1,y1),
         'color': sRGB
         'font': fontname,
-        'size': fontzise,
+        'size': fontsize,
         'flags': fontflags,
         'chars': [ chars ],
 
@@ -26,7 +21,8 @@ data structure for Span
         'style': [
             {
                 'type': int,
-                'color': int
+                'color': int,
+                'uri': str    # for hyperlink
             },
             ...
         ]
@@ -34,93 +30,95 @@ data structure for Span
 '''
 
 import fitz
-
 from docx.shared import Pt, RGBColor
 from docx.oxml.ns import qn
-
 from .Char import Char
-from ..common.BBox import BBox
+from ..common.Element import Element
 from ..common.share import RectType
 from ..common import constants
 from ..common import share, docx
 from ..shape.Shape import Shape
 
 
-class TextSpan(BBox):
+class TextSpan(Element):
     '''Object representing text span.'''
     def __init__(self, raw:dict=None):
-        if raw is None: raw = {}
+        raw = raw or {}
         self.color = raw.get('color', 0)
-        self._font = raw.get('font', '')
-        self.size = raw.get('size', 12.0)
         self.flags = raw.get('flags', 0)
-        self.chars = [ Char(c) for c in raw.get('chars', []) ] # type: list[Char]
+
+        # filter empty chars
+        chars = [Char(c) for c in raw.get('chars', [])] # type: list[Char]
+        self.chars = [char for char in chars if char.c!='']
+        self._text = raw.get('text', '') # not an original key from PyMuPDF
+
+        # font metrics
+        # line_height is the standard single line height used in relative line spacing,
+        # while exact line spacing is used when line_height==-1 by default.
+        self.font = raw.get('font', '')
+        self.size = raw.get('size', 12.0)
+        self.ascender = raw.get('ascender', 1.0)
+        self.descender = raw.get('descender', 0.0)
+        self.line_height = raw.get('line_height', -1)  # not an original key
 
         # introduced attributes
         # a list of dict: { 'type': int, 'color': int }
         self.style = raw.get('style', [])
+
+        # char spacing between adjacent two chars -> pdf operador Tc
+        # positive to expand space, otherwise condense
+        # just an attribute placeholder: not used yet
+        self.char_spacing = raw.get('char_spacing', 0.0)
         
-        # init bbox
+        # init text span element
         super().__init__(raw)
 
-        # update bbox if no font is set
-        if 'UNNAMED' in self.font.upper(): self.set_font('Arial')        
-
-
-    @property
-    def font(self):
-        '''Parse raw font name, e.g. 
-            - split with '+' and '-': BCDGEE+Calibri-Bold, BCDGEE+Calibri -> Calibri
-            - split with upper case : ArialNarrow -> Arial Narrow, but exception: NSimSUN -> NSimSUN
-            - replace ',' with blank: e.g. Ko Pub Dotum, Light -> KoPubDotum Light
-        
-            NSimSUN refers to Chinese font name `新宋体`, so consider a localization mapping.
-        '''
-        # process on '+' and '-'
-        font_name = self._font.split('+')[-1]
-        font_name = font_name.split('-')[0]
-
-        # mapping font name
-        key = font_name.replace(' ', '').replace('-', '').replace('_', '').upper() # normalize mapping key
-        font_name = constants.DICT_FONTS.get(key, font_name)
-
-        # replace ','
-        font_name = font_name.replace(',', ' ')
-
-        return font_name
+        # in rare case, the font is unamed, so change font and update bbox accordingly
+        if 'UNNAMED' in self.font.upper():
+            self._change_font_and_update_bbox(constants.DEFAULT_FONT_NAME)
 
 
     @property
     def text(self):
-        '''Joining chars in text span'''
-        chars = [char.c for char in self.chars]        
-        return ''.join(chars)
+        '''Get span text. Note joining chars is in a higher priority.'''
+        return ''.join([char.c for char in self.chars]) if self.chars else self._text
 
+    @text.setter
+    def text(self, value):
+        '''Set span text directly in case no chars are stores, e.g. restored from json.'''
+        self._text = value
     
     def cal_bbox(self):
-        '''calculate bbox based on contained instances.'''
+        '''Calculate bbox based on contained instances.'''
         bbox = fitz.Rect()
         for char in self.chars: bbox |= char.bbox
         return bbox
 
+    @property
+    def is_valid_line_height(self): return self.line_height!=-1
 
-    def set_font(self, fontname):
-        ''' Set new font, and update font size, span/char bbox accordingly.
 
-            It's generally used for span with unnamed fonts.
-            https://github.com/pymupdf/PyMuPDF/issues/642
+    def _change_font_and_update_bbox(self, font_name:str):
+        '''Set new font, and update font size, span/char bbox accordingly.
 
-            In corner case, where the PDF file containing unnamed and not embedded fonts, the span bbox
-            extracted from PyMuPDF is not correct. PyMuPDF provides feature to replace these unnamed fonts
-            with specified fonts, then extract correct bbox from the updated PDF. Since we care less about
-            the original PDF itself but its layout, the idea here is to set a default font for text spans 
-            with unnamed fonts, and estimate the updated bbox with method from `fitz.TextWriter`.
+        It's generally used for span with unnamed fonts. 
+        See this `issue <https://github.com/pymupdf/PyMuPDF/issues/642>`_.        
+
+        In corner case, where the PDF file containing unnamed and not embedded fonts, the span bbox
+        extracted from ``PyMuPDF`` is not correct. ``PyMuPDF`` provides feature to replace these 
+        unnamed fonts with specified fonts, then extract correct bbox from the updated PDF. Since we 
+        care less about the original PDF itself but its layout, the idea here is to set a default font 
+        for text spans with unnamed fonts, and estimate the updated bbox with method from 
+        ``fitz.TextWriter``.
+
+        Args:
+            font_name (str): Font name.
         '''
-        # set new font
-        font = fitz.Font(fontname)
-        self._font = fontname
+        # set new font property
+        self.font = font_name
 
         # compute text length under new font with that size
+        font = fitz.Font(font_name)
         new_length = font.text_length(self.text, fontsize=self.size)
         if new_length > self.bbox.width:
             self.size *= self.bbox.width / new_length
@@ -156,7 +154,7 @@ class TextSpan(BBox):
 
     
     def lstrip(self):
-        '''remove blanks at the left side, but keep one blank.'''
+        '''Remove blanks at the left side, but keep one blank.'''
         original_text = self.text
         if not original_text.startswith(' '*2): return False
 
@@ -168,7 +166,7 @@ class TextSpan(BBox):
     
 
     def rstrip(self):
-        '''remove blanks at the right side, but keep one blank.'''
+        '''Remove blanks at the right side, but keep one blank.'''
         original_text = self.text
         if not original_text.endswith(' '*2): return False
 
@@ -185,13 +183,12 @@ class TextSpan(BBox):
             'color': self.color,
             'font': self.font,
             'size': self.size,
+            'line_height': self.line_height, 
             'flags': self.flags,
-            'chars': [
-                char.store() for char in self.chars
-            ],
             'text': self.text,
-            'style': self.style
-        })
+            'style': self.style,
+            'char_spacing': self.char_spacing
+        }) # not storing chars for space saving
         return res
 
 
@@ -199,12 +196,23 @@ class TextSpan(BBox):
 
 
     def split(self, rect:Shape, horizontal:bool=True):
-        '''Split span with the intersection: span-intersection-span.'''
+        """Split span with the intersection: span-intersection-span.
+
+        Args:
+            rect (Shape): Target shape to split this text span.
+            horizontal (bool, optional): Text direction. Defaults to True.
+
+        Returns:
+            list: Split text spans.
+        """        
         # any intersection in this span?
+        # NOTE: didn't consider the case that an underline is out of a span
         intsec = rect.bbox & self.bbox
 
         # no, then add this span as it is
-        if not intsec: return [self]
+        # Note the case bool(intsec)=True but intsec.get_area()=0
+        if intsec.is_empty: return [self]
+        
 
         # yes, then split spans:
         # - add new style to the intersection part
@@ -248,7 +256,7 @@ class TextSpan(BBox):
             bbox = (intsec.x0, intsec.y0, intsec.x1, intsec.y1)
             split_span = self.copy().update_bbox(bbox)
             split_span.chars = self.chars[pos:pos_end]            
-            split_span.parse_text_style(rect, horizontal)  # update style
+            split_span._parse_text_format(rect, horizontal)  # update style
             split_spans.append(split_span)
 
         # right part if exists
@@ -264,12 +272,29 @@ class TextSpan(BBox):
         return split_spans
 
 
-    def parse_text_style(self, rect: Shape, horizontal:bool=True):
-        '''Parse text style based on the position to a span bbox.'''
+    def _parse_text_format(self, rect:Shape, horizontal:bool=True):
+        """Parse text style based on the position to a rect shape.
 
-        # consider text format type only
-        if rect.type==RectType.BORDER or rect.type==RectType.SHADING:
+        Args:
+            rect (Shape): Target rect shape reprenting potential text style.
+            horizontal (bool, optional): Horizontal text direction. Defaults to True.
+
+        Returns:
+            bool: Parsed text style successfully or not.
+        """
+
+        # Skip table border/shading
+        if rect.equal_to_type(RectType.BORDER) or rect.equal_to_type(RectType.SHADING):
             return False
+        
+        # set hyperlink
+        elif rect.equal_to_type(RectType.HYPERLINK):
+            self.style.append({
+                'type': rect.type,
+                'color': rect.color,
+                'uri': rect.uri
+            })
+            return True
 
         # considering text direction
         idx = 1 if horizontal else 0
@@ -280,7 +305,7 @@ class TextSpan(BBox):
         h_span = self.bbox[idx+2] - self.bbox[idx]
 
         # distance to span bottom border
-        d = self.bbox[idx+2] - rect.bbox[idx]
+        d = abs(self.bbox[idx+2] - rect.bbox[idx])
 
         # highlight: both the rect height and overlap must be large enough
         if h_rect >= 0.5*h_span:
@@ -296,15 +321,11 @@ class TextSpan(BBox):
         elif 0.35*h_span < d < 0.75*h_span:
             rect.type = RectType.STRIKE
 
-        # unknown style
-        else:
-            rect.type = RectType.UNDEFINED
-
         # check rect type again
-        if rect.type==RectType.UNDEFINED: return False
+        if not rect.is_determined: return False
 
         style =  {
-            'type': rect.type.value,
+            'type': rect.type,
             'color': rect.color
         }
         self.style.append(style)
@@ -314,9 +335,9 @@ class TextSpan(BBox):
 
     def intersects(self, rect):
         '''Create new TextSpan object with chars contained in given bbox.
-            ---
-            Args:
-              - rect: fitz.Rect, target bbox
+        
+        Args:
+            rect (fitz.Rect): Target bbox.
         '''
         # add span directly if fully contained in bbox
         if rect.contains(self.bbox):
@@ -340,10 +361,31 @@ class TextSpan(BBox):
 
 
     def make_docx(self, paragraph):
-        '''Add text span to a docx paragraph.'''
-        # set text
-        docx_span = paragraph.add_run(self.text)        
+        '''Add text span to a docx paragraph, and set text style, e.g. font, color, underline, hyperlink, etc.
 
+        .. note::
+            Hyperlink and its style is parsed separately from pdf. For instance, regarding a general hyperlink with an
+            underline, the text and uri is parsed as hyperlink itself, while the underline is treated as a normal text
+            style.
+        '''
+        # Create hyperlink in particular, otherwise add a run directly
+        for style in self.style:
+            if style['type']==RectType.HYPERLINK.value and self.text.strip():
+                docx_run = docx.add_hyperlink(paragraph, style['uri'], self.text)
+                break
+        else:
+            docx_run = paragraph.add_run(self.text)
+        
+        # set text style, e.g. font, underline and highlight
+        self._set_text_format(docx_run)
+
+        # set charaters spacing
+        if self.char_spacing: 
+            docx.set_char_spacing(docx_run, self.char_spacing)
+
+
+    def _set_text_format(self, docx_run):
+        '''Set text format for ``python-docx.run`` object.'''
         # set style
         # https://python-docx.readthedocs.io/en/latest/api/text.html#docx.text.run.Font
 
@@ -354,26 +396,26 @@ class TextSpan(BBox):
         # bit 2: serifed (2^2)
         # bit 3: monospaced (2^3)
         # bit 4: bold (2^4)
-        docx_span.superscript = bool(self.flags & 2**0)
-        docx_span.italic = bool(self.flags & 2**1)
-        docx_span.bold = bool(self.flags & 2**4)
+        docx_run.superscript = bool(self.flags & 2**0)
+        docx_run.italic = bool(self.flags & 2**1)
+        docx_run.bold = bool(self.flags & 2**4)
 
         # font name
         font_name = self.font
-        docx_span.font.name = font_name
-        docx_span._element.rPr.rFonts.set(qn('w:eastAsia'), font_name) # set font for chinese characters
-        docx_span.font.color.rgb = RGBColor(*share.rgb_component(self.color))
+        docx_run.font.name = font_name
+        docx_run._element.rPr.rFonts.set(qn('w:eastAsia'), font_name) # set font for chinese characters
+        docx_run.font.color.rgb = RGBColor(*share.rgb_component(self.color))
 
         # font size
         # NOTE: only x.0 and x.5 is accepted in docx, so set character scaling accordingly
         # if the font size doesn't meet this condition.
         font_size = round(self.size*2)/2.0
-        docx_span.font.size = Pt(font_size)
+        docx_run.font.size = Pt(font_size)
 
         # adjust by set scaling
         scale = self.size / font_size
         if abs(scale-1.0)>=0.01:
-            docx.set_char_scaling(docx_span, scale)
+            docx.set_char_scaling(docx_run, scale)
         
         # font style parsed from PDF rectangles: 
         # e.g. highlight, underline, strike-through-line
@@ -383,18 +425,16 @@ class TextSpan(BBox):
             # Built-in method is provided to set highlight in python-docx, but supports only limited colors;
             # so, set character shading instead if out of highlight color scope
             if t==RectType.HIGHLIGHT.value:
-                docx.set_char_shading(docx_span, style['color'])
+                docx.set_char_shading(docx_run, style['color'])
 
             # underline set with built-in method `font.underline` has a same color with text.
             # so, try to set a different color with xml if necessary
             elif t==RectType.UNDERLINE.value:
                 if self.color==style['color']:
-                    docx_span.font.underline = True
+                    docx_run.font.underline = True
                 else:
-                    docx.set_char_underline(docx_span, style['color'])
+                    docx.set_char_underline(docx_run, style['color'])
             
             # same color with text for strike line
             elif t==RectType.STRIKE.value:
-                docx_span.font.strike = True
-
-        
+                docx_run.font.strike = True

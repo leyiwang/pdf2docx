@@ -1,4 +1,7 @@
 include *.md
 include LICENSE*
 include requirements.txt
-recursive-include test *.py *.pdf
+include pdf2docx/gui/*.ico
+prune test
+include test/*.py
+include test/samples/*.pdf
